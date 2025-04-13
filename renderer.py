@@ -1,3 +1,5 @@
+from turtle import color
+from typing import List
 from gsplat import rasterization
 from pathlib import Path
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
@@ -9,6 +11,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 from plyfile import PlyData
+from sklearn.decomposition import PCA
 
 
 def RGB2SH(rgb):
@@ -34,9 +37,20 @@ class renderer:
             self.filter_index = None
 
         self.feature = F.normalize(self.feature.float(), dim=1)
+        pca = PCA(n_components=3)
+        self.feature_pca =  torch.tensor(pca.fit_transform(self.feature.cpu().numpy())).cuda()
+        # Min-Max normalization for each channel (component)
+        # Apply min-max normalization per channel
+        min_vals = self.feature_pca.min(dim=(0), keepdim=True).values  # Min along H, W (spatial dimensions)
+        max_vals = self.feature_pca.max(dim=(0), keepdim=True).values  # Max along H, W
+
+        # Normalize each channel to [0, 1]
+        self.feature_pca = RGB2SH((self.feature_pca - min_vals) / (max_vals - min_vals))
+
 
 
         self.text_feature = None
+        self.segmentation_mask = None
 
 
 
@@ -109,44 +123,60 @@ class renderer:
             self.color: torch.Tensor = torch.cat((model.features_dc[:, None, :], model.features_rest), dim=1).cuda()
     
 
-    def attention_score(self, text: str, filtering: bool = True, sh: bool = True)-> torch.Tensor:
+    def attention_score(self, texts: list, filtering: bool = True, sh: bool = True) -> torch.Tensor:
         """
-            Convert Gaussian embedding to attention score related to text
-            Args: 
-                text: str that you want to related 
-                filtering: usually set true, to make the score visualized
-            Returns: RGB color for visualization or return SH level for visualization
-        """ 
-        self.text_feature:torch.Tensor = self.text_model.model.model.encode_text(self.tokenizer(text).to(self.means.device)).float().squeeze()
-        self.text_feature = F.normalize(self.text_feature, dim=0)
+        Convert Gaussian embedding to attention scores related to multiple texts.
+        Args: 
+            texts: list of strings to calculate attention scores for.
+            filtering: usually set true, to make the score visualized.
+        Returns: 
+            Attention scores in RGB for visualization or SH level for visualization.
+        """
 
+        # 1) Encode multiple texts
+        text_features = self.text_model.model.model.encode_text(self.tokenizer(texts).to(self.means.device)).float()
+        text_features = F.normalize(text_features, dim=0) # mc, the positive word is the last one
 
+        print(text_features.shape)
 
+        # 2) Calculate attention scores between each feature and the text features
+        attention = torch.einsum("nc,mc->nm", self.feature, text_features)  # Shape: [n, m], n texts, m features
 
-        attention = torch.einsum("nc,c->n", self.feature, self.text_feature)
+        if attention.shape[1] > 1: # input multiple words
+            max_attention_scores = attention.argmax(dim=-1)  # Shape: [n], find the index of max score for each text
+            
+            self.segmentation_mask = max_attention_scores == (attention.shape[1]-1)
 
+        # 3) Apply filtering if necessary
+        attention = attention[:, -1]
         if filtering:
             attention = self.filtering(attention_score=attention)
-        
+
+        # 4) Normalize the attention scores
         att_min, att_max = attention.min(), attention.max()
         if att_min == att_max:
-            # If they are the same, attention is constant -> make normalized zero
             attention_norm = torch.zeros_like(attention)
         else:
             attention_norm = (attention - att_min) / (att_max - att_min)
-            
-        # 6) Convert to numpy and get colormap RGBA, shape [N, 4]
-        hr_heatmap_rgba = self.cmap(attention_norm.detach().cpu().numpy())
 
-        # 7) Return only the first three channels (RGB), shape [N, 3]
-        hr_heatmap_rgb = hr_heatmap_rgba[..., :3]
+        # 5) Generate heatmap for visualization
+        hr_heatmap_rgba = self.cmap(attention_norm.detach().cpu().numpy())  # Shape: [n, m, 4]
+
+        # 6) Only keep RGB channels (first 3 channels)
+        hr_heatmap_rgb = hr_heatmap_rgba[..., :3]  # Shape: [n, m, 3]
+
+
+        # 8) Assign to self.attention_color based on SH flag
         if sh:
             self.attention_color = torch.tensor(RGB2SH(hr_heatmap_rgb), dtype=torch.float32).cuda()
         else:
             self.attention_color = torch.tensor(hr_heatmap_rgb, dtype=torch.float32).cuda()
-        print("attention score calculation accomplished")
 
+        print("attention score calculation accomplished")
         print(self.attention_color.shape)
+
+        # Return the segmentation mask and attention scores
+        return self.attention_color
 
 
     def filtering(self, attention_score: torch.Tensor)->torch.Tensor:
@@ -187,9 +217,30 @@ class renderer:
                 quats = self.quats
                 scales = torch.exp(self.scales)
                 opacities = torch.sigmoid(self.opacities).squeeze(-1)
+        elif mode == 'Segmentation':
+            sh_degree = 2
+            colors = self.color[self.segmentation_mask]
+            means = self.means[self.segmentation_mask]
+            quats = self.quats[self.segmentation_mask]
+            scales = torch.exp(self.scales[self.segmentation_mask])
+            opacities = torch.sigmoid(self.opacities.squeeze(-1)[self.segmentation_mask])
+        elif mode == "Feature_PCA":
+            colors = self.feature_pca.unsqueeze(1)
+            sh_degree = 0
+            if self.filter_index != None: 
+                means = self.means[self.filter_index]
+                quats = self.quats[self.filter_index]
+                scales = torch.exp(self.scales[self.filter_index])
+                opacities = torch.sigmoid(self.opacities[self.filter_index]).squeeze(-1)
+            else: 
+                means = self.means
+                quats = self.quats
+                scales = torch.exp(self.scales)
+                opacities = torch.sigmoid(self.opacities).squeeze(-1)
+
         else:
             raise NotImplementedError
-        
+
         render, _, _ = rasterization(
             means=means,
             quats=quats,  # rasterization does normalization internally
@@ -209,5 +260,17 @@ class renderer:
             absgrad=False,
             rasterize_mode="antialiased",  
         )
-
+        if mode == "Feature_PCA":
+            """
+                We need to do some post processingm since the input are H,W,C, we need to make it to H,W,3
+            """
+            
         return render.squeeze()
+
+
+
+    def segmentation(self, positive_words: str, background_words: str):
+        words = background_words.split(',')
+        words.append(positive_words)
+
+        self.attention_score(words)
