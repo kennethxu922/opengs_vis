@@ -1,8 +1,9 @@
-from ast import arg, parse
-import re
+from pydoc import text
 from visergui import ViserViewer
 from renderer import renderer
 import torch 
+from feature_mapper import feature_lift_mapper, feature_lift_mapper_config
+from kernel_loader import base_kernel_loader_config, general_gaussian_loader
 
 
 import argparse
@@ -21,12 +22,21 @@ if __name__ == "__main__":
 
     args = parser()
 
+    feature_lift_config = feature_lift_mapper_config(text_tokenizer='featup', text_encoder='maskclip')
+    feature_mapper = feature_lift_mapper(config=feature_lift_config)
+
+    gs_kernel_loader_config = base_kernel_loader_config(
+        kernel_location=args.gs_ckpt,
+        feature_location=args.feat_pt
+    )
+
+    gs_kernel_loader = general_gaussian_loader(gs_kernel_loader_config)
 
 
     with torch.no_grad():
         gs_renderer = renderer(
-            gaussian_ckpt=args.gs_ckpt,
-            feature_path=args.feat_pt,
+            gaussian_loader=gs_kernel_loader,
+            feature_mapper=feature_mapper
         )
 
         viser = ViserViewer(

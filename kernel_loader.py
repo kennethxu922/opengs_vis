@@ -1,4 +1,3 @@
-from distutils.command.config import config
 import torch
 from plyfile import PlyData
 import numpy as np
@@ -23,8 +22,8 @@ class base_kernel_loader_config:
 
 @dataclass
 class Kernel:
-    geometry: Dict[str: torch.Tensor]
-    color: torch.Tensor
+    geometry: Dict[str, torch.Tensor]
+    color: Optional[torch.Tensor] = None
     feature: Optional[torch.Tensor] = None
     feature_id: Optional[torch.Tensor] = None
     meta: Optional[Dict] = None # Others, for future development
@@ -149,7 +148,7 @@ class general_gaussian_loader(base_kernel_loader):
 
             elif self.config.feature_type == 'pt':
                 assert self.config.feature_location.endswith("pt"), f"feature type must be pt as user required, but get feature path: {self.config.feature_location}"
-                feature = torch.load(self.config.feature_location)
+                feature = torch.load(self.config.feature_location).cuda()
 
             else:
                 print(f"currently we only accept pt and ftz file, but get: {model_location}")
@@ -158,7 +157,7 @@ class general_gaussian_loader(base_kernel_loader):
             if len(feature) < len(geometry["means"]):
                 print("detect less feature than geometry, assume finish the feature downsampling")
                 assert os.path.exists(self.config.feature_id_location), f"feature ID location not correct: {self.config.feature_id_location}"
-                feature_id = torch.load(self.config.feature_id_location)                
+                feature_id = torch.load(self.config.feature_id_location).cuda()            
 
         else:
             print("!!!Detect No feature input!!!")
