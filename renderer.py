@@ -153,8 +153,8 @@ class renderer:
             scales = self.scales[self.segmentation_mask]
             opacities = self.opacities[self.segmentation_mask]
         elif mode == "Feature_PCA":
-            colors = self.feature_pca.unsqueeze(1)
             sh_degree = 0
+            colors = self.feature_pca.unsqueeze(1)
             if self.feature_id != None: 
                 means = self.means[self.feature_id]
                 quats = self.quats[self.feature_id]
@@ -163,9 +163,15 @@ class renderer:
             else: 
                 means = self.means
                 quats = self.quats
-                scales = self.scales[self.feature_id]
-                opacities = self.opacities[self.feature_id]
-
+                scales = self.scales
+                opacities = self.opacities
+        elif mode == "Feature": # rendering feature to 2D
+            sh_degree = None
+            colors = self.feature
+            means = self.means
+            quats = self.quats
+            scales = self.scales
+            opacities = self.opacities
         else:
             raise NotImplementedError
 
