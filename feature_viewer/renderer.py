@@ -1,9 +1,4 @@
-from turtle import color
-from typing import List
 from gsplat import rasterization
-from pathlib import Path
-from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
-from featup.featurizers.maskclip.clip import tokenize # maskclip tokenizer
 import torch
 
 
@@ -13,9 +8,8 @@ import numpy as np
 from plyfile import PlyData
 from sklearn.decomposition import PCA
 
-from kernel_loader import general_gaussian_loader
-from feature_mapper import feature_lift_mapper
-from kernel_loader import Kernel
+from gs_loader.kernel_loader import general_gaussian_loader, Kernel
+from gs_loader.feature_mapper import feature_lift_mapper
 
 def RGB2SH(rgb):
     """

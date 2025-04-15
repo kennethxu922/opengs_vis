@@ -1,6 +1,3 @@
-
-
-
 # Embedding Visualization Module
 To visualize the result, we provide additional viser package that can visualize our attneion score in rendering mode
 
@@ -22,6 +19,3 @@ We might support non-Gaussian Kernel Rendering
 - Kernel_Loader
 - Feature_Mapper
 - Renderer(Kernel_Loader, Feature_Mapper)
-
-# Feature Viewer
-- We seperate the loading module, to additional space comapre to master branck

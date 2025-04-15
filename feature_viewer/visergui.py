@@ -8,7 +8,7 @@ import cv2
 from collections import deque
 from nerfstudio.cameras.cameras import Cameras
 import torch
-from renderer import renderer
+from .renderer import renderer
 import tempfile
 import os
 import shutil
