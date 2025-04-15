@@ -115,6 +115,45 @@ class general_gaussian_loader(base_kernel_loader):
             shN = torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
             geometry = {"means": means, "quats": quats, "scales": scales, "opacities": opacities}
             colors = torch.cat((sh0, shN), dim=1)
+            
+            # Check for OpenGaussian instance features
+            property_names = [p.name for p in plydata.elements[0].properties]
+            og_instance_features = []
+
+            # Look for the two sets of instance features
+            first_set = ["ins_feat_r", "ins_feat_g", "ins_feat_b"]
+            second_set = ["ins_feat_r2", "ins_feat_g2", "ins_feat_b2"]
+
+            # Check if sets exist in properties
+            has_first_set = all(name in property_names for name in first_set)
+            has_second_set = all(name in property_names for name in second_set)
+
+            # Build list of feature names to extract
+            if has_first_set:
+                og_instance_features.extend(first_set)
+            if has_second_set:
+                og_instance_features.extend(second_set)
+
+            # If we found OpenGaussian instance features, extract them
+            if og_instance_features:
+                print(f"Found OpenGaussian instance features: {og_instance_features}")
+                
+                # Extract instance features to a numpy array
+                instance_features = np.zeros((xyz.shape[0], len(og_instance_features)), dtype=np.float32)
+                for idx, feat_name in enumerate(og_instance_features):
+                    instance_features[:, idx] = np.asarray(plydata.elements[0][feat_name])
+                
+                # Convert to tensor and normalize for similarity calculations
+                feature_tensor = torch.tensor(instance_features, dtype=torch.float, device="cuda")
+                feature = F.normalize(feature_tensor, dim=1)
+                print(f"Loaded OpenGaussian instance features with shape: {feature.shape}")
+                
+                # Mark that we've already loaded features so we won't load external ones
+                og_features_loaded = True
+            else:
+                og_features_loaded = False
+                print("No OpenGaussian instance features found in PLY")
+            
             torch.cuda.empty_cache()
         
         
