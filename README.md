@@ -1,6 +1,3 @@
-
-
-
 # Embedding Visualization Module
 To visualize the result, we provide additional viser package that can visualize our attneion score in rendering mode
 

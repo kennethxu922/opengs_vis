@@ -1,199 +1,270 @@
-from gsplat import rasterization
 import torch
-
-
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
-from plyfile import PlyData
-from sklearn.decomposition import PCA
-
+import matplotlib.pyplot as plt
+from gsplat import rasterization
 from gs_loader.kernel_loader import general_gaussian_loader, Kernel
 from gs_loader.feature_mapper import feature_lift_mapper
+from typing import List
 
-def RGB2SH(rgb):
+
+def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     """
-    Converts from RGB values [0,1] to the 0th spherical harmonic coefficient
+    Convert normalized RGB [0,1] to 0th spherical harmonic coefficient.
     """
     C0 = 0.28209479177387814
     return (rgb - 0.5) / C0
 
-class renderer:
-    def __init__(self, gaussian_loader: general_gaussian_loader, feature_mapper:feature_lift_mapper)-> None:
-        self.cmap = plt.get_cmap("turbo")
-        
+
+def normalize_tensor(x: torch.Tensor, dim=None, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Min-max normalize tensor to [0, 1] along specified dims.
+    """
+    x = x.detach()
+    mn = x.min(dim=dim, keepdim=True).values if dim is not None else x.min()
+    mx = x.max(dim=dim, keepdim=True).values if dim is not None else x.max()
+    return (x - mn) / (mx - mn + eps)
+
+
+class Renderer:
+    """
+    High-level renderer for Gaussian splats with multiple modes:
+      - RGB, Attention, Segmentation, Feature, Feature_PCA, Weight_Filtered, Mask
+    """
+
+    def __init__(
+        self,
+        gaussian_loader: general_gaussian_loader,
+        feature_mapper: feature_lift_mapper,
+        colormap_name: str = "turbo"
+    ) -> None:
         kernels: Kernel = gaussian_loader.load()
-        self.colors = kernels.color
-        self.means = kernels.geometry['means']
-        self.quats = kernels.geometry['quats']
-        self.scales = torch.exp(kernels.geometry['scales'])
-        self.opacities = torch.sigmoid(kernels.geometry['opacities']).squeeze(-1)
-        self.feature_id = kernels.feature_id
-        self.feature = kernels.feature
+        self._init_geometry(kernels)
         self.feature_mapper = feature_mapper
+        self.cmap = plt.get_cmap(colormap_name)
 
-        self.feature = self.feature_mapper.pre_project_mapping(self.feature)
-
-
-        pca = PCA(n_components=3)
-        self.feature_pca =  torch.tensor(pca.fit_transform(self.feature.cpu().numpy())).cuda()
-        # Min-Max normalization for each channel (component)
-        # Apply min-max normalization per channel
-        min_vals = self.feature_pca.min(dim=(0), keepdim=True).values  # Min along H, W (spatial dimensions)
-        max_vals = self.feature_pca.max(dim=(0), keepdim=True).values  # Max along H, W
-
-        # Normalize each channel to [0, 1]
-        self.feature_pca = RGB2SH((self.feature_pca - min_vals) / (max_vals - min_vals))
-
+        # Precompute feature PCA colors
+        self.feature_pca = self._compute_feature_pca(kernels.feature)
         self.segmentation_mask = None
-        
-        print("set up renderer accomplsihed")
+        self.attention_color = None
+        self.attention_score_forall = None
+        self.global_scale_value = 1
 
+        print("Renderer setup complete.")
 
-    def attention_score(self, texts: list, filtering: bool = True, sh: bool = True) -> torch.Tensor:
+    def _init_geometry(self, kernels: Kernel) -> None:
+        geom = kernels.geometry
+        # ensure float32 and no grad
+        self.colors = kernels.color.detach().to(torch.float32)
+        self.means = geom['means'].detach().to(torch.float32)
+        self.quats = geom['quats'].detach().to(torch.float32)
+        self.scales = torch.exp(geom['scales'].detach().to(torch.float32))
+        self.opacities = torch.sigmoid(geom['opacities'].detach().to(torch.float32)).squeeze(-1)
+        self.feature_id = kernels.feature_id
+        self.feature = kernels.feature.detach().to(torch.float32)
+        self.attention_weight = kernels.attention_weight.detach().to(torch.float32)
+
+    def _compute_feature_pca(self, feature: torch.Tensor) -> torch.Tensor:
+        feat = feature.detach().to(torch.float32)
+        self.feature = self.feature_mapper.pre_project_mapping(feat)
+        mean = self.feature.mean(dim=0, keepdim=True)
+        Xc = self.feature - mean
+        cov = (Xc.t() @ Xc) / (Xc.shape[0] - 1)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        idx = torch.argsort(eigvals, descending=True)[:3]
+        components = eigvecs[:, idx]
+        coords = Xc @ components
+        normed = normalize_tensor(coords, dim=0)
+        return rgb_to_sh(normed)
+
+    def attention_score(
+        self,
+        texts: List[str],
+        filtering: bool = True,
+        sh: bool = True,
+        mask: bool = False
+    ) -> torch.Tensor:
         """
         Convert Gaussian embedding to attention scores related to multiple texts.
-        Args: 
+        Args:
             texts: list of strings to calculate attention scores for.
-            filtering: usually set true, to make the score visualized.
-        Returns: 
-            Attention scores in RGB for visualization or SH level for visualization.
+            filtering: usually True, clamps below-mean values.
+            sh: if True, convert RGB heatmap to spherical-harmonic color.
+            mask: if True, only update segmentation_mask and return None.
+        Returns:
+            attention color tensor if mask=False, else None.
         """
+        with torch.no_grad():
+            # 1) encode texts
+            txt_feat = self.feature_mapper.text_mapping(texts).detach().to(torch.float32)
+            # compute raw scores [n_features, n_texts]
+            scores = torch.einsum("nc,mc->nm", self.feature, txt_feat)
+            self.attention_score_forall = scores
 
-        # 1) Encode multiple texts
-        text_features = self.feature_mapper.text_mapping(texts)
+            # segmentation: last text is positive class
+            if scores.shape[1] > 1:
+                max_idx = scores.argmax(dim=-1)
+                self.segmentation_mask = (max_idx == (scores.shape[1] - 1))
 
-        # 2) Calculate attention scores between each feature and the text features
-        attention = torch.einsum("nc,mc->nm", self.feature, text_features)  # Shape: [n, m], n texts, m features
+            if mask:
+                return
 
-        if attention.shape[1] > 1: # input multiple words
-            max_attention_scores = attention.argmax(dim=-1)  # Shape: [n], find the index of max score for each text 
-            # The last one is the segmentation target
-            
-            # If the argmax is the last one
-            self.segmentation_mask = max_attention_scores == (attention.shape[1]-1)
+            # select last text's scores
+            att = scores[:, -1]
+            # 3) filter
+            if filtering:
+                att = torch.clamp(att, min=att.mean().item())
+            # 4) normalize
+            att_min, att_max = att.min(), att.max()
+            if att_min == att_max:
+                att_norm = torch.zeros_like(att)
+            else:
+                att_norm = (att - att_min) / (att_max - att_min)
 
-        # 3) Apply filtering if necessary
-        attention = attention[:, -1]
-        if filtering:
-            attention = self.filtering(attention_score=attention)
+            # 5) heatmap
+            rgba = self.cmap(att_norm.cpu().numpy())
+            rgb = torch.tensor(rgba[..., :3], dtype=torch.float32, device=att.device)
 
-        # 4) Scale the attention scores
-        att_min, att_max = attention.min(), attention.max()
-        if att_min == att_max:
-            attention_norm = torch.zeros_like(attention)
-        else:
-            attention_norm = (attention - att_min) / (att_max - att_min)
-            #attention_norm = torch.sigmoid(2 * (attention_norm - 0.5)) #  We will see if it is better or not
+            # 6) assign
+            if sh:
+                self.attention_color = rgb_to_sh(rgb)
+            else:
+                self.attention_color = rgb
+            return self.attention_color
 
-        # 5) Generate heatmap for visualization
-        hr_heatmap_rgba = self.cmap(attention_norm.detach().cpu().numpy())  # Shape: [n, m, 4]
-
-        # 6) Only keep RGB channels (first 3 channels)
-        hr_heatmap_rgb = hr_heatmap_rgba[..., :3]  # Shape: [n, m, 3]
-
-
-        # 8) Assign to self.attention_color based on SH flag
-        if sh:
-            self.attention_color = torch.tensor(RGB2SH(hr_heatmap_rgb), dtype=torch.float32).cuda()
-        else:
-            self.attention_color = torch.tensor(hr_heatmap_rgb, dtype=torch.float32).cuda()
-
-        # Return the segmentation mask and attention scores
-        return self.attention_color
-
-    def filtering(self, attention_score: torch.Tensor)->torch.Tensor:
+    def segmentation(
+        self,
+        positive_words: str,
+        background_words: str,
+        mask: bool = True
+    ) -> torch.Tensor:
         """
-        Clips (clamps) all values in x to lie within [mean - 2*std, mean + 2*std].
+        Run segmentation: compute mask for positive vs background.
+        Args:
+            positive_words: target class description
+            background_words: comma-separated negatives
+            mask: always True here (populates self.segmentation_mask)
+        Returns:
+            segmentation mask tensor
         """
-        mean = attention_score.mean()
-        lower_bound = mean 
+        # split background by commas
+        bg_list = [w.strip() for w in background_words.split(',') if w.strip()]
+        # compose queries: background(s) first, then positive
+        queries = bg_list + [positive_words]
+        self.attention_score(queries, filtering=False, sh=False, mask=mask)
+        return self.segmentation_mask
 
-        # Clamp the values to [lower_bound, upper_bound]
-        return attention_score.clamp(min=lower_bound.item())
+    def weight_filtering(self, ratio: float = 0.5) -> None:
+        n = len(self.attention_weight)
+        k = int(n * min(max(ratio, 0.0), 1.0))
+        _, idx = torch.topk(self.attention_weight, k)
+        self.weighted_indices = idx
 
-    def render(self, w2c: np.ndarray, k: np.ndarray, mode: str, H: int,W: int)-> torch.Tensor:
-        """
-            input camera location, should give out the rendered result depends on mode
-        """
-        w2c = torch.tensor(w2c).cuda().unsqueeze(0).to(torch.float32)
-        k = torch.tensor(k).cuda().unsqueeze(0).to(torch.float32)
+    def mask_heatmap(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.detach().to(torch.float32)
+        last = tensor[..., -1]
+        last_n = normalize_tensor(last)
+        argmax = tensor.argmax(dim=-1)
+        mask = (argmax == (tensor.shape[-1] - 1)).float()
+        heat = (last_n * mask).cpu().numpy()
+        rgba = self.cmap(heat)
+        return torch.tensor(rgba[..., :3], dtype=torch.float32)
 
-        if mode == 'RGB':
-            sh_degree = 2
-            colors = self.colors
-            means = self.means
-            quats = self.quats
-            scales = self.scales
-            opacities = self.opacities
-        elif mode == 'Attention': 
-            sh_degree = 0
-            colors = self.attention_color.unsqueeze(1)
-            if self.feature_id != None: 
-                means = self.means[self.feature_id]
-                quats = self.quats[self.feature_id]
-                scales = self.scales[self.feature_id]
-                opacities = self.opacities[self.feature_id]
-            else: 
-                means = self.means
-                quats = self.quats
-                scales = self.scales
-                opacities = self.opacities
-        elif mode == 'Segmentation':
-            sh_degree = 2
-            colors = self.colors[self.segmentation_mask]
-            means = self.means[self.segmentation_mask]
-            quats = self.quats[self.segmentation_mask]
-            scales = self.scales[self.segmentation_mask]
-            opacities = self.opacities[self.segmentation_mask]
-        elif mode == "Feature_PCA":
-            sh_degree = 0
-            colors = self.feature_pca.unsqueeze(1)
-            if self.feature_id != None: 
-                means = self.means[self.feature_id]
-                quats = self.quats[self.feature_id]
-                scales = self.scales[self.feature_id]
-                opacities = self.opacities[self.feature_id]
-            else: 
-                means = self.means
-                quats = self.quats
-                scales = self.scales
-                opacities = self.opacities
-        elif mode == "Feature": # rendering feature to 2D
-            sh_degree = None
-            colors = self.feature
-            means = self.means
-            quats = self.quats
-            scales = self.scales
-            opacities = self.opacities
-        else:
-            raise NotImplementedError
+    def render(
+        self,
+        w2c: np.ndarray,
+        K: np.ndarray,
+        mode: str,
+        H: int,
+        W: int
+    ) -> torch.Tensor:
+        view = torch.tensor(w2c, dtype=torch.float32, device=self.means.device, requires_grad=False).unsqueeze(0)
+        Ks   = torch.tensor(K,   dtype=torch.float32, device=self.means.device, requires_grad=False).unsqueeze(0)
 
-        render, _, _ = rasterization(
+        colors, means, quats, scales, opac, sh_deg = self._mode_config(mode)
+        colors = torch.as_tensor(colors, dtype=torch.float32, device=self.means.device)
+        means  = torch.as_tensor(means,  dtype=torch.float32, device=self.means.device)
+        quats  = torch.as_tensor(quats,  dtype=torch.float32, device=self.means.device)
+        scales = torch.as_tensor(scales, dtype=torch.float32, device=self.means.device)*self.global_scale_value
+        opac   = torch.as_tensor(opac,   dtype=torch.float32, device=self.means.device)
+
+        rendered, alphas, _ = rasterization(
             means=means,
-            quats=quats,  # rasterization does normalization internally
+            quats=quats,
             scales=scales,
-            opacities=opacities,
+            opacities=opac,
             colors=colors,
-            viewmats=w2c,  # [1, 4, 4]
-            Ks=k,  # [1, 3, 3]
+            viewmats=view,
+            Ks=Ks,
             width=W,
             height=H,
             packed=True,
             near_plane=0.01,
             far_plane=1e10,
             render_mode='RGB',
-            sh_degree=sh_degree,
+            sh_degree=sh_deg,
             sparse_grad=False,
             absgrad=False,
-            rasterize_mode="antialiased",  
+            rasterize_mode="antialiased",
         )
-            
-        return render.squeeze()
+        img = rendered.squeeze(0)
+        if mode == 'Mask':
+            return self.mask_heatmap(img)
+        if mode == 'Metrics_Mask':
+            return img, alphas
+        return img
 
-    def segmentation(self, positive_words: str, background_words: str):
-        words = background_words.split(',')
-        words.append(positive_words)
+    def _mode_config(self, mode: str):
+        if mode == 'RGB':
+            return self.colors, self.means, self.quats, self.scales, self.opacities, 2
+        if mode == 'Attention':
+            return self.attention_color.unsqueeze(1), *self._select_feature_subset(), 0
+        if mode == 'Segmentation':
+            if self.segmentation_mask is None:
+                raise RuntimeError("Segmentation mask not computed. Call `segmentation(...)` first.")
+            return self._filter_by_mask(self.segmentation_mask, 2)
+        if mode == 'Feature_PCA':
+            return self.feature_pca.unsqueeze(1), *self._select_feature_subset(), 0
+        if mode == 'Feature':
+            return self.feature, self.means, self.quats, self.scales, self.opacities, None
+        if mode == 'Weight_Filtered':
+            idx = self.weighted_indices
+            return self.colors[idx], *self._select_feature_subset(), 2
+        if mode.endswith('Mask'):
+            return self.attention_score_forall, *self._select_feature_subset(), None
+        raise ValueError(f"Unknown render mode: {mode}")
 
-        print(words)
-        self.attention_score(words)
+
+    def set_gaussian_scale(self, s):
+        self.global_scale_value = s
+
+    def _select_feature_subset(self, colors = False):
+        idx = self.feature_id if self.feature_id is not None else slice(None)
+        if colors: 
+            return (
+                self.colors[idx],
+                self.means[idx],
+                self.quats[idx],
+                self.scales[idx],
+                self.opacities[idx]
+            )
+        else:
+            return (
+                self.means[idx],
+                self.quats[idx],
+                self.scales[idx],
+                self.opacities[idx]
+            )
+
+    def _filter_by_mask(self, mask: torch.Tensor, sh_degree: int):
+        if self.feature_id != None:
+            colors, means, quats, scales, opacities = self._select_feature_subset(colors=True)
+
+        idx = mask.nonzero(as_tuple=True)[0]
+        return (
+            colors[idx],
+            means[idx],
+            quats[idx],
+            scales[idx],
+            opacities[idx],
+            sh_degree
+        )
