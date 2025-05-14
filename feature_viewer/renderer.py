@@ -61,7 +61,10 @@ class Renderer:
         self.opacities = torch.sigmoid(geom['opacities'].detach().to(torch.float32)).squeeze(-1)
         self.feature_id = kernels.feature_id
         self.feature = kernels.feature.detach().to(torch.float32)
-        self.attention_weight = kernels.attention_weight.detach().to(torch.float32)
+        if kernels.attention_weight != None:
+            self.attention_weight = kernels.attention_weight.detach().to(torch.float32)
+        else:
+            self.attention_weight = None
 
     def _compute_feature_pca(self, feature: torch.Tensor) -> torch.Tensor:
         feat = feature.detach().to(torch.float32)
@@ -154,6 +157,8 @@ class Renderer:
         return self.segmentation_mask
 
     def weight_filtering(self, ratio: float = 0.5) -> None:
+        if self.attention_weight == None:
+            return
         n = len(self.attention_weight)
         k = int(n * min(max(ratio, 0.0), 1.0))
         _, idx = torch.topk(self.attention_weight, k)
@@ -228,7 +233,7 @@ class Renderer:
             return self.feature, self.means, self.quats, self.scales, self.opacities, None
         if mode == 'Weight_Filtered':
             idx = self.weighted_indices
-            return self.colors[idx], *self._select_feature_subset(), 2
+            return self.colors[idx], *self._select_feature_subset(idx), 2
         if mode.endswith('Mask'):
             return self.attention_score_forall, *self._select_feature_subset(), None
         raise ValueError(f"Unknown render mode: {mode}")
@@ -237,8 +242,9 @@ class Renderer:
     def set_gaussian_scale(self, s):
         self.global_scale_value = s
 
-    def _select_feature_subset(self, colors = False):
-        idx = self.feature_id if self.feature_id is not None else slice(None)
+    def _select_feature_subset(self, idx = None, colors = False):
+        if idx == None:
+            idx = self.feature_id if self.feature_id is not None else slice(None)
         if colors: 
             return (
                 self.colors[idx],

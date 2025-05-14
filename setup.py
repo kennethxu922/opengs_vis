@@ -9,7 +9,7 @@ setup(
     ],
     author='Butian Xiong',
     author_email='xiongbutian768@gmail.com',
-    description='Just update the viser that can see the weight difference by rank',
+    description='Support weight filtering camera exportation as PT file, and openGuassian viser, specailly design for feature visualization',
     long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/yourusername/your-repo',  # Update with your repository URL if available
